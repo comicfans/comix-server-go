@@ -9,7 +9,9 @@ import (
 	"fmt"
 	//"github.com/goware/urlx"
 	"archive/zip"
+	"sync"
 	"io"
+	"container/list"
 	"log"
 	"net"
 	"net/http"
@@ -44,20 +46,13 @@ func listDir(fullpath string, w http.ResponseWriter) {
 
 	w.Header().Set("Content-Type", "text/plain")
 
-	walkfunc := func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
+    res := dirList(fullpath)
 
-		if path != fullpath {
+    for _,f := range res{
+        fmt.Fprintln(w, f)
+    }
 
-			fmt.Fprintln(w, info.Name())
-		}
 
-		return nil
-	}
-
-	filepath.Walk(fullpath, walkfunc)
 }
 
 func isInZip(path string, ext string) bool {
@@ -267,6 +262,236 @@ type ContextAdapter struct {
 
 func (ca *ContextAdapter) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	ca.handler.ServeHTTPContext(ca.ctx, rw, req)
+}
+
+
+type DirCache struct{
+    abspath string
+    filelist *List
+    memUsage int
+}
+
+/**
+* @brief cache file in zip
+*/
+type FileCache struct{
+    abspath string
+    typestr string
+    memory []byte
+}
+
+type GlobalCache struct{
+    rwMutex sync.RWMutex
+    cacheMap map[string]CacheResult
+    lru map[string]int
+}
+
+func dirList(path string) container.List{
+
+    ret := list.New
+    walkfunc := func(path string, info os.FileInfo, err error) error {
+        if err != nil {
+            return err
+        }
+
+        if path != fullpath {
+            ret.PushBack(path)
+        }
+
+        return nil
+    }
+
+    filepath.Walk(fullpath, walkfunc)
+
+    return ret
+
+}
+
+type FileInZip struct{
+    file File 
+    fullname string
+}
+
+
+
+func readInfoInZip(fullpath string, preloadBid int) (
+    bidList *Ring,r ReaderCloser){
+
+    zippos := strings.Index(fullpath, "zip")
+	if zippos == -1 {
+		zippos = strings.Index(fullpath, "cbz")
+	}
+
+	zipfilepath := fullpath[0 : zippos+3]
+
+	log.Println("zip file path:" + zipfilepath)
+
+	imagepath := strings.Replace(fullpath, zipfilepath+"/", "", -1)
+
+	log.Println("image path :" + imagepath)
+
+	reader, err := zip.OpenReader(zipfilepath)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+    ret:=ring.New()
+
+    found := false
+
+    var toRead *FileInZip =nil
+	for _, f := range reader.File {
+
+		fi := f.FileInfo()
+        
+
+		if fi.Name() == imagepath {
+
+            found=true
+            idx = bidList.Len()-1
+
+        }else{
+
+            if bidList.Len() > preloadBid*2 {
+                break
+            }
+
+            if !found && bidList.Len()>preloadBid{
+                bidList.Remove(bidList.Front())
+            }
+        }
+	}
+
+    if found {
+        reorderPreloadList(bidList)
+    }
+}
+
+func loadFileInZip(wg sync.WaitGroup,cache *GlobalCache,fiz FileInZip){
+
+    if _,ok:=cache.cacheMap[f.fullname]{
+
+        defer wg.Done()
+
+        return
+    }
+
+    rc, err := fiz.file.Open()
+    if err != nil {
+        log.Println(err)
+    }
+    defer rc.Close()
+
+    _, err = io.Copy(w, rc)
+    if err != nil {
+        log.Println(err)
+    }
+}
+
+func readerCloseRoute(wg sync.WaitGroup,rc ReaderCloser){
+
+}
+
+func loadAsCache (path string ) *CacheResult{
+
+
+    if isDir(path) {
+
+        ret = new DirCache{
+            abspath path
+            filelist dirList()
+        }
+
+        return ret
+    }
+
+    ext := filepath.Ext(fullpath)
+
+	if len(ext) >= 1 {
+
+		ext = ext[1:]
+	}
+
+	log.Printf("ext of %s is %s", fullpath, ext)
+
+	typestr := getContentType(ext)
+
+	log.Printf("type of %s is %s", fullpath, typestr)
+
+	if isInZip(fullpath, ext) {
+
+        preloadList := readInfoInZip(fullpath)
+
+        if preloadList ==nil {
+            return 
+        }
+
+        current := preloadList.Value()
+
+        loadFileInZip(current)
+
+        //preload in background
+        for ()
+
+    }
+}
+
+func addToCache(path string,cache *CacheResult){
+
+
+    g.rwMutex.Lock()
+    defer g.rwMutex.Unlock()
+
+    if val,ok:=g.cacheMap ; ok{
+        //already added by other thread
+
+        return
+    }
+
+    g.cacheMap[path] = cache
+}
+
+func (g *GlobalCache) load (path string) *CacheResult{
+
+    g.rwMutex.RLock()
+
+    if val,ok:=g.cacheMap[path] ;ok{
+        g.rwMutex.RUnlock()
+        return val
+    }
+
+    g.rwMutex.RUnlock()
+    loaded := loadAsCache(path)
+
+    if loaded == nil {
+       return nil 
+    }
+
+    go addToCache(path,loaded)
+
+    return loaded
+}
+
+type CacheResult interface {
+
+    MemUsage()int
+}
+
+func (f *FileCache) Process(ctx *AppContext,w http.ResponseWriter){
+
+    w.Header().Add("Content",f.typestr);
+    w.Write(f.memory);
+}
+
+func (d *DirCache) Process(ctx *AppContext,w http.ResponseWriter){
+
+    w.Header().Set("Content-Type", "text/plain")
+
+    for _,name:= range d.filelist {
+        fmt.Fprintln(w, name)
+    }
+
 }
 
 func main() {
