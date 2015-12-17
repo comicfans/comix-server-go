@@ -344,7 +344,6 @@ func readInfoInZip(fullpath string, preloadBid int) (
 	for _, f := range reader.File {
 
 		fi := f.FileInfo()
-        
 
 		if fi.Name() == imagepath {
 
@@ -368,14 +367,16 @@ func readInfoInZip(fullpath string, preloadBid int) (
     }
 }
 
-func loadFileInZip(wg sync.WaitGroup,cache *GlobalCache,fiz FileInZip){
+func loadFileInZip(wg *sync.WaitGroup,cache *GlobalCache,fiz FileInZip) *CacheResult{
 
-    if _,ok:=cache.cacheMap[f.fullname]{
+    defer wg.Done()
 
-        defer wg.Done()
-
-        return
+    cache.rwMutex.RLock()
+    if v,ok:=cache.cacheMap[f.fullname]{
+        cache.rwMutex.RUnlock()
+        return v
     }
+    cache.rwMutex.RUnlock()
 
     rc, err := fiz.file.Open()
     if err != nil {
@@ -387,6 +388,22 @@ func loadFileInZip(wg sync.WaitGroup,cache *GlobalCache,fiz FileInZip){
     if err != nil {
         log.Println(err)
     }
+
+    fc := FileCache{
+        fullpath  fiz.fullpath
+        typestr fiz.typestr
+        memory io.Read(rc)
+    }
+
+    fc.memUsage = Len(fc.memory) + Len(fc.fullpath)
+
+    cache.rwMutex.Lock()
+    cache.cacheMap [fullpath] = fc
+
+    defer cache.rwMutex.UnLock()
+
+    return fc
+
 }
 
 func readerCloseRoute(wg sync.WaitGroup,rc ReaderCloser){
@@ -395,13 +412,14 @@ func readerCloseRoute(wg sync.WaitGroup,rc ReaderCloser){
 
 func loadAsCache (path string ) *CacheResult{
 
-
     if isDir(path) {
 
         ret = new DirCache{
             abspath path
             filelist dirList()
         }
+
+        go addToCache(ret)
 
         return ret
     }
@@ -429,11 +447,19 @@ func loadAsCache (path string ) *CacheResult{
 
         current := preloadList.Value()
 
-        loadFileInZip(current)
+        currentRequested := loadFileInZip(nil,current)
 
+        wg := sync.WaitGroup 
         //preload in background
-        for ()
+        for i:= preloadList.Next();i!=nil;i=preload(){
 
+            wg.Add(1);
+            go loadFileInZip(&wg,i)
+        }
+
+        go readerCloseRoute(wg)
+
+        return currentRequested
     }
 }
 
@@ -467,8 +493,6 @@ func (g *GlobalCache) load (path string) *CacheResult{
     if loaded == nil {
        return nil 
     }
-
-    go addToCache(path,loaded)
 
     return loaded
 }
