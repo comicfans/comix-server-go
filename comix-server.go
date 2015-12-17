@@ -9,9 +9,9 @@ import (
 	"fmt"
 	//"github.com/goware/urlx"
 	"archive/zip"
-	"sync"
-	"io"
 	"container/list"
+	"container/ring"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 var imageExt = []string{"jpg", "gif", "png", "tif", "bmp", "jpeg", "tiff"}
@@ -46,12 +47,12 @@ func listDir(fullpath string, w http.ResponseWriter) {
 
 	w.Header().Set("Content-Type", "text/plain")
 
-    res := dirList(fullpath)
+	res := dirList(fullpath)
 
-    for _,f := range res{
-        fmt.Fprintln(w, f)
-    }
+	for e := res.Front(); e != nil; e = e.Next() {
 
+		fmt.Fprintln(w, e.Value)
+	}
 
 }
 
@@ -264,60 +265,63 @@ func (ca *ContextAdapter) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	ca.handler.ServeHTTPContext(ca.ctx, rw, req)
 }
 
+type BaseCache struct {
+	abspath  string
+	memUsage int
+}
 
-type DirCache struct{
-    abspath string
-    filelist *List
-    memUsage int
+type DirCache struct {
+	BaseCache
+	filelist *list.List
+	memUsage int
 }
 
 /**
 * @brief cache file in zip
-*/
-type FileCache struct{
-    abspath string
-    typestr string
-    memory []byte
+ */
+type FileCache struct {
+	BaseCache
+	typestr string
+	memory  []byte
 }
 
-type GlobalCache struct{
-    rwMutex sync.RWMutex
-    cacheMap map[string]CacheResult
-    lru map[string]int
+type GlobalCache struct {
+	rwMutex  sync.RWMutex
+	cacheMap map[string]*CacheResult
+	lru      map[string]int
 }
 
-func dirList(path string) container.List{
+func dirList(fullpath string) *list.List {
 
-    ret := list.New
-    walkfunc := func(path string, info os.FileInfo, err error) error {
-        if err != nil {
-            return err
-        }
+	ret := list.New()
+	walkfunc := func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
 
-        if path != fullpath {
-            ret.PushBack(path)
-        }
+		if path != fullpath {
+			ret.PushBack(path)
+		}
 
-        return nil
-    }
+		return nil
+	}
 
-    filepath.Walk(fullpath, walkfunc)
+	filepath.Walk(fullpath, walkfunc)
 
-    return ret
+	return ret
 
 }
 
-type FileInZip struct{
-    file File 
-    fullname string
+type FileInZip struct {
+	file     zip.File
+	fullname string
+	typestr  string
 }
-
-
 
 func readInfoInZip(fullpath string, preloadBid int) (
-    bidList *Ring,r ReaderCloser){
+	preloadList *ring.Ring, r *zip.ReadCloser) {
 
-    zippos := strings.Index(fullpath, "zip")
+	zippos := strings.Index(fullpath, "zip")
 	if zippos == -1 {
 		zippos = strings.Index(fullpath, "cbz")
 	}
@@ -336,95 +340,86 @@ func readInfoInZip(fullpath string, preloadBid int) (
 		return
 	}
 
-    ret:=ring.New()
+	cur := ring.New(preloadBid*2 + 1)
 
-    found := false
+	found := false
 
-    var toRead *FileInZip =nil
 	for _, f := range reader.File {
 
 		fi := f.FileInfo()
 
+		cur.Value = zipfilepath + "/" + fi.Name()
+		cur = cur.Next()
+
 		if fi.Name() == imagepath {
 
-            found=true
-            idx = bidList.Len()-1
+			preloadList = cur.Prev()
 
-        }else{
-
-            if bidList.Len() > preloadBid*2 {
-                break
-            }
-
-            if !found && bidList.Len()>preloadBid{
-                bidList.Remove(bidList.Front())
-            }
-        }
+		}
 	}
 
-    if found {
-        reorderPreloadList(bidList)
-    }
+	return
 }
 
-func loadFileInZip(wg *sync.WaitGroup,cache *GlobalCache,fiz FileInZip) *CacheResult{
+func loadFileInZip(wg *sync.WaitGroup, cache *GlobalCache, fiz FileInZip) *CacheResult {
 
-    defer wg.Done()
+	defer wg.Done()
 
-    cache.rwMutex.RLock()
-    if v,ok:=cache.cacheMap[f.fullname]{
-        cache.rwMutex.RUnlock()
-        return v
-    }
-    cache.rwMutex.RUnlock()
+	cache.rwMutex.RLock()
+	if v, ok := cache.cacheMap[fiz.fullname]; ok {
+		cache.rwMutex.RUnlock()
+		return v
+	}
+	cache.rwMutex.RUnlock()
 
-    rc, err := fiz.file.Open()
-    if err != nil {
-        log.Println(err)
-    }
-    defer rc.Close()
+	rc, err := fiz.file.Open()
+	if err != nil {
+		log.Println(err)
+	}
+	defer rc.Close()
 
-    _, err = io.Copy(w, rc)
-    if err != nil {
-        log.Println(err)
-    }
+	fc := FileCache{
+		abspath: fiz.fullname,
+		typestr: fiz.typestr,
+		memory:  make([]byte, int(fiz.file.FileInfo().Size())),
+	}
 
-    fc := FileCache{
-        fullpath  fiz.fullpath
-        typestr fiz.typestr
-        memory io.Read(rc)
-    }
+	_, err = io.ReadFull(rc, fc.memory)
+	if err != nil {
+		log.Println(err)
+		return nil
+	}
 
-    fc.memUsage = Len(fc.memory) + Len(fc.fullpath)
+	fc.memUsage = Len(fc.memory) + Len(fc.fullpath)
 
-    cache.rwMutex.Lock()
-    cache.cacheMap [fullpath] = fc
+	cache.rwMutex.Lock()
+	cache.cacheMap[fullpath] = fc
 
-    defer cache.rwMutex.UnLock()
+	defer cache.rwMutex.UnLock()
 
-    return fc
-
-}
-
-func readerCloseRoute(wg sync.WaitGroup,rc ReaderCloser){
+	return fc
 
 }
 
-func loadAsCache (path string ) *CacheResult{
+func readerCloseRoute(wg sync.WaitGroup, rc ReaderCloser) {
 
-    if isDir(path) {
+}
 
-        ret = new DirCache{
-            abspath path
-            filelist dirList()
-        }
+func loadAsCache(path string) *CacheResult {
 
-        go addToCache(ret)
+	if isDir(path) {
 
-        return ret
-    }
+		ret := DirCache{
+			abspath:  path,
+			filelist: dirList(),
+		}
 
-    ext := filepath.Ext(fullpath)
+		go addToCache(ret)
+
+		return &ret
+	}
+
+	ext := filepath.Ext(fullpath)
 
 	if len(ext) >= 1 {
 
@@ -439,82 +434,84 @@ func loadAsCache (path string ) *CacheResult{
 
 	if isInZip(fullpath, ext) {
 
-        preloadList := readInfoInZip(fullpath)
+		preloadList := readInfoInZip(fullpath)
 
-        if preloadList ==nil {
-            return 
-        }
+		if preloadList == nil {
+			return
+		}
 
-        current := preloadList.Value()
+		preloadList, rc := preloadList.Value()
 
-        currentRequested := loadFileInZip(nil,current)
+		if preloadList == nil {
+			return
+		}
 
-        wg := sync.WaitGroup 
-        //preload in background
-        for i:= preloadList.Next();i!=nil;i=preload(){
+		currentRequested := loadFileInZip(nil, preloadList.Value)
 
-            wg.Add(1);
-            go loadFileInZip(&wg,i)
-        }
+		wg := sync.WaitGroup
+		//preload in background
+		for i := preloadList.Next(); i != nil; i = preload() {
 
-        go readerCloseRoute(wg)
+			wg.Add(1)
+			go loadFileInZip(&wg, i)
+		}
 
-        return currentRequested
-    }
+		go readerCloseRoute(wg)
+
+		return currentRequested
+	}
 }
 
-func addToCache(path string,cache *CacheResult){
+func addToCache(path string, cache *CacheResult) {
 
+	g.rwMutex.Lock()
+	defer g.rwMutex.Unlock()
 
-    g.rwMutex.Lock()
-    defer g.rwMutex.Unlock()
+	if val, ok := g.cacheMap; ok {
+		//already added by other thread
 
-    if val,ok:=g.cacheMap ; ok{
-        //already added by other thread
+		return
+	}
 
-        return
-    }
-
-    g.cacheMap[path] = cache
+	g.cacheMap[path] = cache
 }
 
-func (g *GlobalCache) load (path string) *CacheResult{
+func (g *GlobalCache) load(path string) *CacheResult {
 
-    g.rwMutex.RLock()
+	g.rwMutex.RLock()
 
-    if val,ok:=g.cacheMap[path] ;ok{
-        g.rwMutex.RUnlock()
-        return val
-    }
+	if val, ok := g.cacheMap[path]; ok {
+		g.rwMutex.RUnlock()
+		return val
+	}
 
-    g.rwMutex.RUnlock()
-    loaded := loadAsCache(path)
+	g.rwMutex.RUnlock()
+	loaded := loadAsCache(path)
 
-    if loaded == nil {
-       return nil 
-    }
+	if loaded == nil {
+		return nil
+	}
 
-    return loaded
+	return loaded
 }
 
 type CacheResult interface {
-
-    MemUsage()int
+	MemUsage() int
 }
 
-func (f *FileCache) Process(ctx *AppContext,w http.ResponseWriter){
+func (f *FileCache) Process(ctx *AppContext, w http.ResponseWriter) {
 
-    w.Header().Add("Content",f.typestr);
-    w.Write(f.memory);
+	w.Header().Add("Content", f.typestr)
+	w.Write(f.memory)
 }
 
-func (d *DirCache) Process(ctx *AppContext,w http.ResponseWriter){
+func (d *DirCache) Process(ctx *AppContext, w http.ResponseWriter) {
 
-    w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Content-Type", "text/plain")
 
-    for _,name:= range d.filelist {
-        fmt.Fprintln(w, name)
-    }
+	for _, name := range d.filelist {
+		fmt.Fprintln(w, name)
+	}
 
 }
 
