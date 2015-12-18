@@ -12,7 +12,6 @@ import (
 	"container/ring"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"path"
@@ -28,9 +27,11 @@ var hiddenPartname = []string{"__MACOSX"}
 
 type AppContext struct {
 	root string
-    preloadBid int
-    memLimit int
-    globalCache *GlobalCache
+	//how many picture in zip will be preloaded ( forward = backword = preloadNumber)
+	//0 disable, -1 unlimit
+	preloadNumber int
+	memLimit      uint64
+	globalCache   *GlobalCache
 }
 
 type ContextHandler interface {
@@ -121,22 +122,29 @@ func processFileInZip(appcontex *AppContext,
 
 func processImage(w http.ResponseWriter, fullpath string, typestr string) {
 
-    w.Header().Add("Content-Type", typestr)
+	w.Header().Add("Content-Type", typestr)
 
 	f, err := os.Open(fullpath)
-    if err!=nil {
-        log.Println("error opening "+fullpath)
-        return
-    }
+	if err != nil {
+		log.Println("error opening " + fullpath)
+		return
+	}
 
-    defer file.Close()
+	defer f.Close()
 
-    w.Header().Add("Content-Length", strconv.FormatInt(file.FileInfo.Size, 10))
-    n,er:=io.Copy(file,w)
-    if er!=nil{
-        log.Println("error reading "+fullpath)
-        return
-    }
+	fi, errr := f.Stat()
+	if errr != nil {
+		log.Println("error stat " + fullpath)
+		return
+	}
+
+	w.Header().Add("Content-Length", strconv.FormatInt(fi.Size(), 10))
+	n, er := io.Copy(w, f)
+	if er != nil {
+		log.Println("error reading " + fullpath)
+		return
+	}
+	log.Println("reading " + strconv.FormatInt(n, 10) + " bytes")
 }
 
 func isSupport(filename string, isdir bool) bool {
@@ -284,8 +292,8 @@ func (ca *ContextAdapter) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 }
 
 type BaseCache struct {
-	relpath string
-	memUsage int
+	relpath  string
+	memUsage uint64
 }
 
 type DirCache struct {
@@ -304,43 +312,60 @@ type FileCache struct {
 
 type GlobalCache struct {
 	rwMutex  sync.RWMutex
-	cacheMap map[string] CacheResult
+	cacheMap map[string]CacheResult
 	lru      map[string]int
-    memUsage int
-    zipMap map[string]string
+	memUsage uint64
+	zipMap   map[string][]string
 }
 
-func (ctx *AppContext)adjustCache(){
+func mbString(byteNumber uint64) string {
 
-    g := ctx.globalCache
-    g.rwMutex.RLock()
-    if(g.memUsage< ctx.memLimit){
-        g.rwMutex.RUnlock()
-        return
-    }
-
-    g.rwMutex.RUnlock()
-
-    g.rwMutex.Lock()
-    defer g.rwMutex.Unlock()
-    if(g.memUsage < ctx.memLimit){
-        //double check
-        return
-    }
-    //TODO select from LRU
+	switch {
+	case byteNumber < 1024*1024:
+		return strconv.FormatFloat(float64(byteNumber)/1024, 'f', 2, 32) + "KB"
+	case byteNumber < 1024*1024*1024:
+		return strconv.FormatFloat(float64(byteNumber)/1024/1024, 'f', 2, 32) + "MB"
+	default:
+		return strconv.FormatFloat(float64(byteNumber)/1024/1024/1024, 'f', 2, 32) + "GB"
+	}
 
 }
 
-func dirList(fullpath string) []string{
+func (ctx *AppContext) adjustCache() {
 
-    ret := []string{}
+	g := ctx.globalCache
+	g.rwMutex.RLock()
+	if g.memUsage < ctx.memLimit {
+
+		log.Println("cache size ", mbString(g.memUsage),
+			" not exclude limit ", mbString(ctx.memLimit))
+		g.rwMutex.RUnlock()
+		return
+	}
+
+	g.rwMutex.RUnlock()
+
+	g.rwMutex.Lock()
+	defer g.rwMutex.Unlock()
+	if g.memUsage < ctx.memLimit {
+		//double check
+		return
+	}
+	//TODO select from LRU
+	log.Println("not implements")
+
+}
+
+func dirList(fullpath string) []string {
+
+	ret := []string{}
 	walkfunc := func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 
 		if path != fullpath {
-            ret=append(ret ,path)
+			ret = append(ret, path)
 		}
 
 		return nil
@@ -353,15 +378,43 @@ func dirList(fullpath string) []string{
 }
 
 type FileInZip struct {
-	file     zip.File
-    /**
-    * relpath to root 
-    */
+	file zip.File
+	/**
+	 * relpath to root
+	 */
 	relpath string
-	typestr  string
+	typestr string
 }
 
-func readInfoInZip(fullpath string, relpath string,preloadBid int) (
+func readZipCache(fullpath string, preloadNumber int) (
+	cacheResult CacheResult, preloadLis *ring.Ring, r *zip.ReadCloser) {
+
+	reader, err := zip.OpenReader(fullpath)
+	if err != nil {
+		log.Println(err)
+		return nil, nil, nil
+	}
+
+	cur := ring.New(preloadNumber)
+
+	cacheResult = &DirCache{}
+
+	for _, f := range reader.File {
+
+		fi := f.FileInfo()
+
+		cur.Value = zipfilepath + "/" + fi.Name()
+		cur = cur.Next()
+
+		if fi.Name() == imagepath {
+
+			preloadList = cur.Prev()
+
+		}
+	}
+}
+
+func readInfoInZip(fullpath string, relpath string, preloadNumber int) (
 	preloadList *ring.Ring, r *zip.ReadCloser, zipfilepath string) {
 
 	zippos := strings.Index(fullpath, "zip")
@@ -383,7 +436,7 @@ func readInfoInZip(fullpath string, relpath string,preloadBid int) (
 		return
 	}
 
-	cur := ring.New(preloadBid*2 + 1)
+	cur := ring.New(preloadNumber*2 + 1)
 
 	for _, f := range reader.File {
 
@@ -402,7 +455,7 @@ func readInfoInZip(fullpath string, relpath string,preloadBid int) (
 	return
 }
 
-func loadFileInZip(cache *GlobalCache, fiz FileInZip,zipPath string,wg *sync.WaitGroup) CacheResult {
+func loadSingleFileInZip(cache *GlobalCache, fiz FileInZip, zipPath string, wg *sync.WaitGroup) CacheResult {
 
 	defer wg.Done()
 
@@ -419,10 +472,10 @@ func loadFileInZip(cache *GlobalCache, fiz FileInZip,zipPath string,wg *sync.Wai
 	}
 	defer rc.Close()
 
-    fc := &FileCache{
-        BaseCache :BaseCache{
-            relpath: fiz.relpath,
-        },
+	fc := &FileCache{
+		BaseCache: BaseCache{
+			relpath: fiz.relpath,
+		},
 		typestr: fiz.typestr,
 		memory:  make([]byte, int(fiz.file.FileInfo().Size())),
 	}
@@ -433,44 +486,57 @@ func loadFileInZip(cache *GlobalCache, fiz FileInZip,zipPath string,wg *sync.Wai
 		return nil
 	}
 
-	fc.memUsage = len(fc.memory)+ len(fc.relpath)
+	fc.memUsage = uint64(len(fc.memory)) + uint64(len(fc.relpath))
 
 	cache.rwMutex.Lock()
 	defer cache.rwMutex.Unlock()
 
-    //must double check ,or we may add it in another thread
-    //then calc wrong memUsage
-    if v, ok := cache.cacheMap[fiz.relpath]; ok {
+	//must double check ,or we may add it in another thread
+	//then calc wrong memUsage
+	if v, ok := cache.cacheMap[fiz.relpath]; ok {
 		return v
 	}
 
 	cache.cacheMap[fiz.relpath] = fc
-    cache.memUsage += fc.memUsage
+	cache.memUsage += fc.memUsage
 
 	return fc
 }
 
 func readerCloseRoute(wg *sync.WaitGroup, rc *zip.ReadCloser) {
 
-    wg.Wait()
-    rc.Close()
+	wg.Wait()
+	rc.Close()
 }
 
-func loadToCache(ctx *AppContext,relToRoot string,abspath string) (
-    CacheResult,bool,string) {
+func loadMultiFilesInZip(globalCache *GlobalCache, preloadList *ring.Ring, zipPath string, rc *ReadCloser) {
+
+	wg := &sync.WaitGroup{}
+	//preload in background
+	for i := preloadList.Next(); i.Value != nil; i = preloadList.Next() {
+
+		wg.Add(1)
+		go loadSingleFileInZip(globalCache, i.Value.(FileInZip), zipPath, wg)
+	}
+
+	go readerCloseRoute(wg, rc)
+}
+
+func loadToCache(ctx *AppContext, relToRoot string, abspath string) (
+	CacheResult, bool, string) {
 
 	if isDir(abspath) {
 
 		ret := &DirCache{
-            BaseCache: BaseCache{
-                relpath:relToRoot,
-            }  ,
+			BaseCache: BaseCache{
+				relpath: relToRoot,
+			},
 			filelist: dirList(abspath),
 		}
 
-		go addToCache(ctx.globalCache,relToRoot,ret)
+		go addToCache(ctx.globalCache, relToRoot, ret)
 
-		return ret,false,""
+		return ret, false, ""
 	}
 
 	ext := filepath.Ext(relToRoot)
@@ -482,48 +548,42 @@ func loadToCache(ctx *AppContext,relToRoot string,abspath string) (
 
 	log.Printf("ext of %s is %s", relToRoot, ext)
 
-    if !inArray(ext, imageExt) {
-        //not a image file
-		return nil,true,""
+	if !inArray(ext, imageExt) {
+		//not a image file
+		return nil, true, ""
 	}
 
-
-    typestr := getContentType(ext)
+	typestr := getContentType(ext)
 
 	log.Printf("type of %s is %s", relToRoot, typestr)
 
 	if isInZip(relToRoot, ext) {
 
-		preloadList,rc,zipPath := readInfoInZip(abspath,relToRoot,ctx.preloadBid)
+		preloadList, rc, zipPath := readInfoInZip(abspath, relToRoot, ctx.preloadNumber)
 
 		if preloadList.Value == nil {
-            //not found in file
-			return nil,true,typestr
+			//not found in file
+			return nil, true, typestr
 		}
 
+		currentRequested := loadSingleFileInZip(ctx.globalCache,
+			preloadList.Value.(FileInZip), zipPath, nil)
 
-		currentRequested := loadFileInZip(ctx.globalCache, 
-        preloadList.Value.(FileInZip),zipPath,nil)
+		loadMultiFilesInZip(preloadList.Next(), zipPath, rc)
 
-        wg := &sync.WaitGroup{}
-		//preload in background
-		for i := preloadList.Next(); i.Value != nil; i = preloadList.Next() {
-
-			wg.Add(1)
-			go loadFileInZip(ctx.globalCache,i.Value.(FileInZip),zipPath, wg)  
-		}
-
-		go readerCloseRoute(wg,rc)
-
-		return currentRequested,false,""
+		return currentRequested, false, ""
 	}
 
-    //is image file 
-    //TODO
-    return nil,false,typestr
+	if ext == "zip" || ext == "cbz" {
+		readZipCache()
+		return
+	}
+	//is image file
+	//TODO
+	return nil, false, typestr
 }
 
-func addToCache(g *GlobalCache,relToRoot string, cache CacheResult) {
+func addToCache(g *GlobalCache, relToRoot string, cache CacheResult) {
 
 	g.rwMutex.Lock()
 	defer g.rwMutex.Unlock()
@@ -533,62 +593,75 @@ func addToCache(g *GlobalCache,relToRoot string, cache CacheResult) {
 		return
 	}
 
-    //TODO update LRU
+	//TODO update LRU
 	g.cacheMap[relToRoot] = cache
+
+	g.memUsage += cache.MemUsage()
+
+	if fc := cache.(*FileCache); fc != nil {
+		append(g.zipMap[relToRoot], "")
+	}
+
+	log.Println("global cache size ", mbString(g.memUsage))
 }
 
 func cacheViewHandler(
-    ctx *AppContext, w http.ResponseWriter, r *http.Request) {
+	ctx *AppContext, w http.ResponseWriter, r *http.Request) {
 
-        g := ctx.globalCache
+	g := ctx.globalCache
 
-        relToRoot:=r.URL.Path
+	relToRoot := r.URL.Path
 
-        //TODO trim leading slash
+	//TODO trim leading slash
 
-        g.rwMutex.RLock()
+	g.rwMutex.RLock()
 
-        if val, ok := g.cacheMap[relToRoot]; ok {
-            //TODO update LRU
-            g.rwMutex.RUnlock()
-            val.Process(w)
+	if val, ok := g.cacheMap[relToRoot]; ok {
 
-            go ctx.adjustCache()
-            return 
-        }
+		log.Println("found cache for ", relToRoot)
+		//TODO update LRU
+		g.rwMutex.RUnlock()
+		val.Process(w)
 
-        g.rwMutex.RUnlock()
+		go ctx.adjustCache()
+		return
+	}
 
-        abspath := ctx.root + "/"+relToRoot
+	g.rwMutex.RUnlock()
 
-        loaded,hasError,typestr := loadToCache(ctx,relToRoot,abspath)
+	abspath := ctx.root + "/" + relToRoot
 
-        if(hasError){
-            //not in cache or not image
-            return
-        }
+	loaded, hasError, typestr := loadToCache(ctx, relToRoot, abspath)
 
-        if !hasError && loaded!=nil {
-            loaded.Process(w)
-            go ctx.adjustCache()
-            return
-        }
+	if hasError {
+		//not in cache or not image
+		return
+	}
 
-        //no error but not dircache nor filecache, is image file
-        processImage(w,abspath,typestr)
-    }
+	if !hasError && loaded != nil {
+		loaded.Process(w)
+		go ctx.adjustCache()
+		return
+	}
 
-type CacheResult interface {
-
-    Process(http.ResponseWriter)
+	//no error but not dircache nor filecache, is image file
+	processImage(w, abspath, typestr)
 }
 
+type CacheResult interface {
+	Process(http.ResponseWriter)
+	MemUsage() uint64
+}
+
+func (b *BaseCache) MemUsage() uint64 {
+	return b.memUsage
+}
 
 func (f *FileCache) Process(w http.ResponseWriter) {
 
-    w.Header().Add("Content-Type", f.typestr)
-    w.Header().Add("Content-Length", strconv.FormatInt(int64(len(f.memory)), 10))
-    w.Write(f.memory)
+	w.Header().Add("Content-Type", f.typestr)
+	w.Header().Add("Content-Length", strconv.FormatInt(int64(len(f.memory)), 10))
+	w.Write(f.memory)
 }
 
 func (d *DirCache) Process(w http.ResponseWriter) {
@@ -605,31 +678,38 @@ func main() {
 
 	log.SetOutput(os.Stdout)
 
-	ip := flag.String("addr", "0.0.0.0", "listen on address,default 0.0.0.0 (all interface)")
+	ip := flag.String("addr", "0.0.0.0", "listen on address, default listen on all interfaces")
 
-	port := flag.Uint("port", 31257, "listen port , default 31257")
+	port := flag.Uint("port", 31257, "listen port ")
 
-	root := flag.String("", "", "root path of manga, default to 'root' directory of current working dir ")
+	preloadNumber := flag.Int("preload", 10, "preload number in zip file (both forward and backword), 0 to disable , -1 unlimit preload")
+
+	limitMB := flag.Uint("limit", 256, "max cache size (in MB) ")
+
+	root := flag.String("root", "root", "root path of mangas")
 
 	flag.Parse()
 
-	if len(*root) == 0 {
-		wd, _ := os.Getwd()
-		*root = path.Join(wd, "root")
-		log.Println("use " + *root + " as root ")
+	abspath := *root
+
+	if !filepath.IsAbs(*root) {
+		cwd, _ := os.Getwd()
+		abspath = cwd + string(filepath.Separator) + *root
 	}
 
-	if net.ParseIP(*ip) == nil {
-		log.Fatalln("invaid addr " + *ip)
-		return
-	}
+	abspath = path.Clean(abspath)
+
+	log.Println("use " + abspath + "as root dir")
 
 	ipport := *ip + ":" + strconv.Itoa(int(*port))
 
 	log.Println("try to listen on " + ipport)
 
 	appContext := AppContext{
-		root: *root,
+		root:          abspath,
+		memLimit:      uint64(*limitMB) * 1024 * 1024,
+		preloadNumber: *preloadNumber,
+		globalCache:   &GlobalCache{},
 	}
 
 	s := &ContextAdapter{
