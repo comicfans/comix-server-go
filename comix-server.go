@@ -119,7 +119,24 @@ func processFileInZip(appcontex *AppContext,
 
 }
 
-func processImage(w http.ResponseWriter, path string, typestr string) {
+func processImage(w http.ResponseWriter, fullpath string, typestr string) {
+
+    w.Header().Add("Content-Type", typestr)
+
+	f, err := os.Open(fullpath)
+    if err!=nil {
+        log.Println("error opening "+fullpath)
+        return
+    }
+
+    defer file.Close()
+
+    w.Header().Add("Content-Length", strconv.FormatInt(file.FileInfo.Size, 10))
+    n,er:=io.Copy(file,w)
+    if er!=nil{
+        log.Println("error reading "+fullpath)
+        return
+    }
 }
 
 func isSupport(filename string, isdir bool) bool {
