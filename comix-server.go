@@ -294,6 +294,7 @@ func (ca *ContextAdapter) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 type BaseCache struct {
 	relpath  string
 	memUsage uint64
+	rank     uint64
 }
 
 type DirCache struct {
@@ -306,16 +307,23 @@ type DirCache struct {
  */
 type FileCache struct {
 	BaseCache
-	typestr string
-	memory  []byte
+	memory []byte
+}
+
+type RankPair{
+	rank uint64
+	string relpath
 }
 
 type GlobalCache struct {
-	rwMutex  sync.RWMutex
-	cacheMap map[string]CacheResult
-	lru      map[string]int
-	memUsage uint64
-	zipMap   map[string][]string
+	rwMutex   sync.RWMutex
+	cacheMap  map[string]CacheResult
+	memUsage  uint64
+	rankMap   map[uint64]string
+	belongZip map[string][]string
+	rank      uint64
+	//LRU
+	lru 	  []RankPair
 }
 
 func mbString(byteNumber uint64) string {
@@ -378,16 +386,15 @@ func dirList(fullpath string) []string {
 }
 
 type FileInZip struct {
-	file zip.File
+	file *zip.File
 	/**
 	 * relpath to root
 	 */
 	relpath string
-	typestr string
 }
 
-func readZipCache(fullpath string, preloadNumber int) (
-	cacheResult CacheResult, preloadLis *ring.Ring, r *zip.ReadCloser) {
+func readZipCache(relToRoot, fullpath string, preloadNumber int) (
+	cacheResult CacheResult, preloadList *ring.Ring, r *zip.ReadCloser) {
 
 	reader, err := zip.OpenReader(fullpath)
 	if err != nil {
@@ -395,23 +402,43 @@ func readZipCache(fullpath string, preloadNumber int) (
 		return nil, nil, nil
 	}
 
-	cur := ring.New(preloadNumber)
+	//preload from head
+	preloadList = ring.New(preloadNumber)
 
-	cacheResult = &DirCache{}
+	dirCache := DirCache{
+		BaseCache: BaseCache{
+			relpath: relToRoot,
+		},
+	}
 
-	for _, f := range reader.File {
+	for i, f := range reader.File {
 
 		fi := f.FileInfo()
 
-		cur.Value = zipfilepath + "/" + fi.Name()
-		cur = cur.Next()
-
-		if fi.Name() == imagepath {
-
-			preloadList = cur.Prev()
-
+		if !isSupport(fi.Name(), false) {
+			continue
 		}
+
+		relfilepath := relToRoot + "/" + fi.Name()
+
+		if i < preloadNumber {
+
+			fiz := &FileInZip{
+				relpath: relfilepath,
+				file:    f,
+			}
+
+			preloadList.Value = fiz
+			preloadList = preloadList.Next()
+		}
+
+		dirCache.filelist = append(dirCache.filelist, relfilepath)
+
 	}
+
+	cacheResult = &dirCache
+
+	return
 }
 
 func readInfoInZip(fullpath string, relpath string, preloadNumber int) (
@@ -442,7 +469,12 @@ func readInfoInZip(fullpath string, relpath string, preloadNumber int) (
 
 		fi := f.FileInfo()
 
-		cur.Value = zipfilepath + "/" + fi.Name()
+		fiz := &FileInZip{
+			file:    f,
+			relpath: zipfilepath + "/" + fi.Name(),
+		}
+
+		cur.Value = fiz
 		cur = cur.Next()
 
 		if fi.Name() == imagepath {
@@ -450,12 +482,16 @@ func readInfoInZip(fullpath string, relpath string, preloadNumber int) (
 			preloadList = cur.Prev()
 
 		}
+
+		if preloadList != nil && preloadList.Len() > preloadNumber*2 {
+			return
+		}
 	}
 
 	return
 }
 
-func loadSingleFileInZip(cache *GlobalCache, fiz FileInZip, zipPath string, wg *sync.WaitGroup) CacheResult {
+func loadSingleFileInZip(cache *GlobalCache, fiz *FileInZip, zipPath string, wg *sync.WaitGroup) CacheResult {
 
 	defer wg.Done()
 
@@ -476,8 +512,7 @@ func loadSingleFileInZip(cache *GlobalCache, fiz FileInZip, zipPath string, wg *
 		BaseCache: BaseCache{
 			relpath: fiz.relpath,
 		},
-		typestr: fiz.typestr,
-		memory:  make([]byte, int(fiz.file.FileInfo().Size())),
+		memory: make([]byte, int(fiz.file.FileInfo().Size())),
 	}
 
 	_, err = io.ReadFull(rc, fc.memory)
@@ -509,14 +544,14 @@ func readerCloseRoute(wg *sync.WaitGroup, rc *zip.ReadCloser) {
 	rc.Close()
 }
 
-func loadMultiFilesInZip(globalCache *GlobalCache, preloadList *ring.Ring, zipPath string, rc *ReadCloser) {
+func loadMultiFilesInZip(globalCache *GlobalCache, preloadList *ring.Ring, zipPath string, rc *zip.ReadCloser) {
 
 	wg := &sync.WaitGroup{}
 	//preload in background
 	for i := preloadList.Next(); i.Value != nil; i = preloadList.Next() {
 
 		wg.Add(1)
-		go loadSingleFileInZip(globalCache, i.Value.(FileInZip), zipPath, wg)
+		go loadSingleFileInZip(globalCache, i.Value.(*FileInZip), zipPath, wg)
 	}
 
 	go readerCloseRoute(wg, rc)
@@ -534,7 +569,7 @@ func loadToCache(ctx *AppContext, relToRoot string, abspath string) (
 			filelist: dirList(abspath),
 		}
 
-		go addToCache(ctx.globalCache, relToRoot, ret)
+		go addToCache(ctx.globalCache, relToRoot, ret, "")
 
 		return ret, false, ""
 	}
@@ -567,39 +602,58 @@ func loadToCache(ctx *AppContext, relToRoot string, abspath string) (
 		}
 
 		currentRequested := loadSingleFileInZip(ctx.globalCache,
-			preloadList.Value.(FileInZip), zipPath, nil)
+			preloadList.Value.(*FileInZip), zipPath, nil)
 
-		loadMultiFilesInZip(preloadList.Next(), zipPath, rc)
+		loadMultiFilesInZip(ctx.globalCache, preloadList.Next(), zipPath, rc)
 
 		return currentRequested, false, ""
 	}
 
 	if ext == "zip" || ext == "cbz" {
-		readZipCache()
-		return
+		cache, preloadList, rc := readZipCache(abspath, relToRoot, ctx.preloadNumber)
+
+		if cache == nil {
+			return nil, true, ""
+		}
+
+		go addToCache(ctx.globalCache, relToRoot, cache, relToRoot)
+
+		go loadMultiFilesInZip(ctx.globalCache, preloadList, relToRoot, rc)
+
+		return cache, false, ""
 	}
 	//is image file
-	//TODO
 	return nil, false, typestr
 }
 
-func addToCache(g *GlobalCache, relToRoot string, cache CacheResult) {
+func addToCache(g *GlobalCache, relToRoot string, cache CacheResult, belongToZip string) {
 
 	g.rwMutex.Lock()
 	defer g.rwMutex.Unlock()
 
-	if _, ok := g.cacheMap[relToRoot]; ok {
+	old, added := g.cacheMap[relToRoot]
+	if added && belongToZip != "" {
 		//already added by other thread
+
+		fc := old.(*FileCache)
+
+		//update rank
+		delete(g.rankMap, fc.rank)
+		g.rank++
+		g.rankMap[g.rank] = relToRoot
+		fc.rank = g.rank
 		return
 	}
 
-	//TODO update LRU
+	log.Println("update LRU not implemented")
 	g.cacheMap[relToRoot] = cache
 
 	g.memUsage += cache.MemUsage()
 
-	if fc := cache.(*FileCache); fc != nil {
-		append(g.zipMap[relToRoot], "")
+	g.rank++
+	if belongToZip != "" {
+		g.belongZip[relToRoot] = append(g.belongZip[relToRoot], belongToZip)
+		g.rankMap[g.rank] = relToRoot
 	}
 
 	log.Println("global cache size ", mbString(g.memUsage))
@@ -659,7 +713,9 @@ func (b *BaseCache) MemUsage() uint64 {
 
 func (f *FileCache) Process(w http.ResponseWriter) {
 
-	w.Header().Add("Content-Type", f.typestr)
+	ext := filepath.Ext(f.relpath)[1:]
+
+	w.Header().Add("Content-Type", getContentType(ext))
 	w.Header().Add("Content-Length", strconv.FormatInt(int64(len(f.memory)), 10))
 	w.Write(f.memory)
 }
@@ -714,7 +770,7 @@ func main() {
 
 	s := &ContextAdapter{
 		ctx:     &appContext,
-		handler: ContextHandlerFunc(viewHandler),
+		handler: ContextHandlerFunc(cacheViewHandler),
 	}
 
 	err := http.ListenAndServe(ipport, s)
