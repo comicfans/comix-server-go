@@ -45,21 +45,6 @@ func (h ContextHandlerFunc) ServeHTTPContext(ctx *AppContext, rw http.ResponseWr
 	h(ctx, rw, req)
 }
 
-func listDir(fullpath string, w http.ResponseWriter) {
-
-	log.Println("list dir " + fullpath)
-
-	w.Header().Set("Content-Type", "text/plain")
-
-	res := dirList(fullpath)
-
-	for e := range res {
-
-		fmt.Fprintln(w, e)
-	}
-
-}
-
 func isInZip(relpath string, ext string) bool {
 	lowpath := strings.ToLower(relpath)
 
@@ -68,56 +53,6 @@ func isInZip(relpath string, ext string) bool {
 	}
 
 	return ext != "zip" && ext != "cbz"
-
-}
-
-func processFileInZip(appcontex *AppContext,
-	w http.ResponseWriter, fullpath string, typestr string) {
-
-	zippos := strings.Index(fullpath, "zip")
-	if zippos == -1 {
-		zippos = strings.Index(fullpath, "cbz")
-	}
-
-	zipfilepath := fullpath[0 : zippos+3]
-
-	log.Println("zip file path:" + zipfilepath)
-
-	imagepath := strings.Replace(fullpath, zipfilepath+"/", "", -1)
-
-	log.Println("image path :" + imagepath)
-
-	reader, err := zip.OpenReader(zipfilepath)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	defer reader.Close()
-
-	for _, f := range reader.File {
-
-		fi := f.FileInfo()
-
-		if fi.Name() == imagepath {
-
-			log.Println("found image " + imagepath)
-			w.Header().Add("Content-Type", typestr)
-			w.Header().Add("Content-Length", strconv.FormatInt(fi.Size(), 10))
-			rc, err := f.Open()
-			if err != nil {
-				log.Println(err)
-			}
-			defer rc.Close()
-
-			_, err = io.Copy(w, rc)
-			if err != nil {
-				log.Println(err)
-			}
-
-		}
-
-	}
 
 }
 
@@ -167,36 +102,6 @@ func isSupport(filename string, isdir bool) bool {
 	return true
 }
 
-func processZip(appcontex *AppContext,
-	w http.ResponseWriter, fullpath string) {
-
-	log.Printf("process zip %s\n", fullpath)
-
-	if fullpath[len(fullpath)-1:] == "/" {
-		fullpath = fullpath[0 : len(fullpath)-1]
-		log.Printf("as %s\n", fullpath)
-	}
-
-	reader, err := zip.OpenReader(fullpath)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	defer reader.Close()
-
-	for _, f := range reader.File {
-
-		fi := f.FileInfo()
-		if isSupport(fi.Name(), fi.IsDir()) {
-
-			fmt.Fprintln(w, fi.Name())
-		}
-
-	}
-
-}
-
 func getContentType(ext string) string {
 	switch ext {
 	case "jpg":
@@ -235,51 +140,6 @@ func isDir(fullpath string) bool {
 	}
 
 	return fileinfo.IsDir()
-
-}
-
-func viewHandler(ctx *AppContext, w http.ResponseWriter, r *http.Request) {
-	log.Println("request is '" + r.URL.String())
-
-	fullpath := path.Join(ctx.root, r.URL.Path)
-
-	//listDir(r.URL.Path[len("/"):], w)
-	log.Printf("url path %s, after join: %s\n", r.URL.Path, fullpath)
-
-	if isDir(fullpath) {
-		log.Printf("%s is dir \n", fullpath)
-		listDir(fullpath, w)
-		return
-	}
-
-	log.Printf("%s is not dir \n", fullpath)
-
-	ext := filepath.Ext(fullpath)
-	if len(ext) >= 1 {
-
-		ext = ext[1:]
-	}
-
-	log.Printf("ext of %s is %s", fullpath, ext)
-
-	typestr := getContentType(ext)
-
-	log.Printf("type of %s is %s", fullpath, typestr)
-
-	if isInZip(fullpath, ext) {
-		processFileInZip(ctx, w, fullpath, typestr)
-		return
-	}
-
-	if inArray(ext, imageExt) {
-		processImage(w, fullpath, typestr)
-		return
-	}
-
-	if ext == "zip" || ext == "cbz" {
-		processZip(ctx, w, fullpath)
-		return
-	}
 
 }
 
@@ -786,17 +646,21 @@ func cacheViewHandler(
 
 	relToRoot := r.URL.Path
 
+	log.Println("request url ", relToRoot)
+
 	relToRoot = strings.TrimRight(strings.TrimLeft(relToRoot, "/"), "/")
+
+	log.Println("normalized url ", relToRoot)
 
 	g.rwMutex.RLock()
 
 	if val, ok := g.cacheMap[relToRoot]; ok {
 
 		log.Println("found cache for ", relToRoot)
-		//TODO update LRU
 		g.rwMutex.RUnlock()
 		val.Process(w)
 
+		go updateRankLocked(ctx.globalCache, val)
 		go ctx.adjustCache()
 		return
 	}
